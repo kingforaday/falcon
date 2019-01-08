@@ -24,7 +24,7 @@ class StorageEngine(object):
 class StorageError(Exception):
 
     @staticmethod
-    def handle(ex, req, resp, params):
+    def handle(req, resp, ex, params):
         description = ('Sorry, couldn\'t write your thing to the '
                        'database. It worked on my box.')
 
@@ -136,7 +136,7 @@ def max_body(limit):
             msg = ('The size of the request is too large. The body must not '
                    'exceed ' + str(limit) + ' bytes in length.')
 
-            raise falcon.HTTPRequestEntityTooLarge(
+            raise falcon.HTTPPayloadTooLarge(
                 'Request body is too large', msg)
 
     return hook

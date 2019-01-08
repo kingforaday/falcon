@@ -129,7 +129,7 @@ since the latter doesn't work under Windows:
 .. code:: bash
 
     $ pip install waitress
-    $ waitress-serve --port=8000 look:app
+    $ waitress-serve --port=8000 look.app:api
 
 Now, in a different terminal, try querying the running app with curl:
 
@@ -253,6 +253,12 @@ HTTP method you want your resource to support, simply add an ``on_*()``
 method to the class, where ``*`` is any one of the standard
 HTTP methods, lowercased (e.g., ``on_get()``, ``on_put()``,
 ``on_head()``, etc.).
+
+.. note::
+    Supported HTTP methods are those specified in 
+    `RFC 7231 <https://tools.ietf.org/html/rfc7231>`_ and
+    `RFC 5789 <https://tools.ietf.org/html/rfc5789>`_. This includes
+    GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, and PATCH.
 
 We call these well-known methods "responders". Each responder takes (at
 least) two params, one representing the HTTP request, and one representing
@@ -461,7 +467,7 @@ Next, edit ``test_app.py`` to look like this:
         }
 
         response = client.simulate_get('/images')
-        result_doc = msgpack.unpackb(response.content, encoding='utf-8')
+        result_doc = msgpack.unpackb(response.content, raw=False)
 
         assert result_doc == doc
         assert response.status == falcon.HTTP_OK
@@ -642,7 +648,7 @@ call ``help()`` on ``falcon.status_codes``:
 The last line in the ``on_post()`` responder sets the Location header
 for the newly created resource. (We will create a route for that path in
 just a minute.) The :class:`~.Request` and :class:`~.Response` classes
-contain convent attributes for reading and setting common headers, but
+contain convenient attributes for reading and setting common headers, but
 you can always access any header by name with the ``req.get_header()``
 and ``resp.set_header()`` methods.
 
@@ -862,7 +868,7 @@ look similar to this:
         }
 
         response = client.simulate_get('/images')
-        result_doc = msgpack.unpackb(response.content, encoding='utf-8')
+        result_doc = msgpack.unpackb(response.content, raw=False)
 
         assert result_doc == doc
         assert response.status == falcon.HTTP_OK
@@ -1143,7 +1149,7 @@ Go ahead and edit your ``images.py`` file to look something like this:
 
         def on_get(self, req, resp, name):
             resp.content_type = mimetypes.guess_type(name)[0]
-            resp.stream, resp.stream_len = self._image_store.open(name)
+            resp.stream, resp.content_length = self._image_store.open(name)
 
 
     class ImageStore(object):
@@ -1180,9 +1186,9 @@ Go ahead and edit your ``images.py`` file to look something like this:
 
             image_path = os.path.join(self._storage_path, name)
             stream = self._fopen(image_path, 'rb')
-            stream_len = os.path.getsize(image_path)
+            content_length = os.path.getsize(image_path)
 
-            return stream, stream_len
+            return stream, content_length
 
 As you can see, we renamed ``Resource`` to ``Collection`` and added a new ``Item``
 class to represent a single image resource. Alternatively, these two classes could
@@ -1197,9 +1203,9 @@ URI parameters in a moment.
 Inside the ``on_get()`` responder,
 we set the Content-Type header based on the filename extension, and then
 stream out the image directly from an open file handle. Note the use of
-``resp.stream_len``. Whenever using ``resp.stream`` instead of ``resp.body`` or
-``resp.data``, you typically also specify the expected length of the stream so
-that the web client knows how much data to read from the response.
+``resp.content_length``. Whenever using ``resp.stream`` instead of ``resp.body`` or
+``resp.data``, you typically also specify the expected length of the stream using the
+Content-Length header, so that the web client knows how much data to read from the response.
 
 .. note:: If you do not know the size of the stream in advance, you can work around
    that by using chunked encoding, but that's beyond the scope of this
@@ -1435,7 +1441,7 @@ as follows:
             resp.content_type = mimetypes.guess_type(name)[0]
 
             try:
-                resp.stream, resp.stream_len = self._image_store.open(name)
+                resp.stream, resp.content_length = self._image_store.open(name)
             except IOError:
                 # Normally you would also log the error.
                 raise falcon.HTTPNotFound()

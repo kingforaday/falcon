@@ -51,9 +51,9 @@ SimpleCookie = http_cookies.SimpleCookie
 DEFAULT_ERROR_LOG_FORMAT = (u'{0:%Y-%m-%d %H:%M:%S} [FALCON] [ERROR]'
                             u' {1} {2}{3} => ')
 
-TRUE_STRINGS = ('true', 'True', 'yes', '1', 'on')
-FALSE_STRINGS = ('false', 'False', 'no', '0', 'off')
-WSGI_CONTENT_HEADERS = ('CONTENT_TYPE', 'CONTENT_LENGTH')
+TRUE_STRINGS = frozenset(['true', 'True', 'yes', '1', 'on'])
+FALSE_STRINGS = frozenset(['false', 'False', 'no', '0', 'off'])
+WSGI_CONTENT_HEADERS = frozenset(['CONTENT_TYPE', 'CONTENT_LENGTH'])
 
 # PERF(kgriffs): Avoid an extra namespace lookup when using these functions
 strptime = datetime.strptime
@@ -117,8 +117,6 @@ class Request(object):
 
             (See also: RFC 7239, Section 1)
 
-        protocol (str): Deprecated alias for `scheme`. Will be removed
-            in a future release.
         method (str): HTTP method requested (e.g., 'GET', 'POST', etc.)
         host (str): Host request header field
         forwarded_host (str): Original host request header as received
@@ -449,8 +447,8 @@ class Request(object):
             if self.query_string:
                 self._params = parse_query_string(
                     self.query_string,
-                    keep_blank_qs_values=self.options.keep_blank_qs_values,
-                    parse_qs_csv=self.options.auto_parse_qs_csv,
+                    keep_blank=self.options.keep_blank_qs_values,
+                    csv=self.options.auto_parse_qs_csv,
                 )
 
             else:
@@ -658,7 +656,7 @@ class Request(object):
         except ValueError:
             href = 'http://goo.gl/zZ6Ey'
             href_text = 'HTTP/1.1 Range Requests'
-            msg = ('It must be a range formatted according to RFC 7233.')
+            msg = 'It must be a range formatted according to RFC 7233.'
             raise errors.HTTPInvalidHeader(msg, 'Range', href=href,
                                            href_text=href_text)
 
@@ -714,18 +712,13 @@ class Request(object):
 
         return scheme
 
-    # TODO(kgriffs): Remove this deprecated alias in Falcon 2.0
-    protocol = scheme
-
     @property
     def uri(self):
         if self._cached_uri is None:
-            scheme = self.env['wsgi.url_scheme']
-
             # PERF: For small numbers of items, '+' is faster
             # than ''.join(...). Concatenation is also generally
             # faster than formatting.
-            value = (scheme + '://' +
+            value = (self.scheme + '://' +
                      self.netloc +
                      self.relative_uri)
 
@@ -926,8 +919,6 @@ class Request(object):
     @property
     def netloc(self):
         env = self.env
-        protocol = env['wsgi.url_scheme']
-
         # NOTE(kgriffs): According to PEP-3333 we should first
         # try to use the Host header if present.
         #
@@ -939,7 +930,7 @@ class Request(object):
             netloc_value = env['SERVER_NAME']
 
             port = env['SERVER_PORT']
-            if protocol == 'https':
+            if self.scheme == 'https':
                 if port != '443':
                     netloc_value += ':' + port
             else:
@@ -950,7 +941,7 @@ class Request(object):
 
     @property
     def media(self):
-        if self._media:
+        if self._media is not None or self.bounded_stream.is_exhausted:
             return self._media
 
         handler = self.options.media_handlers.find_by_media_type(
@@ -958,11 +949,15 @@ class Request(object):
             self.options.default_media_type
         )
 
-        # Consume the stream
-        raw = self.bounded_stream.read()
+        try:
+            self._media = handler.deserialize(
+                self.bounded_stream,
+                self.content_type,
+                self.content_length
+            )
+        finally:
+            self.bounded_stream.exhaust()
 
-        # Deserialize and Return
-        self._media = handler.deserialize(raw)
         return self._media
 
     # ------------------------------------------------------------------------
@@ -1130,7 +1125,7 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is present.
             default (any): If the param is not found returns the
-                given value instead of None
+                given value instead of ``None``
 
         Returns:
             str: The value of the param as a string, or ``None`` if param is
@@ -1163,8 +1158,8 @@ class Request(object):
 
         raise errors.HTTPMissingParam(name)
 
-    def get_param_as_int(self, name,
-                         required=False, min=None, max=None, store=None):
+    def get_param_as_int(self, name, required=False, min_value=None,
+                         max_value=None, store=None, default=None):
         """Return the value of a query string parameter as an int.
 
         Args:
@@ -1175,15 +1170,17 @@ class Request(object):
                 ``HTTPBadRequest`` instead of returning ``None`` when the
                 parameter is not found or is not an integer (default
                 ``False``).
-            min (int): Set to the minimum value allowed for this
-                param. If the param is found and it is less than min, an
+            min_value (int): Set to the minimum value allowed for this
+                param. If the param is found and it is less than min_value, an
                 ``HTTPError`` is raised.
-            max (int): Set to the maximum value allowed for this
+            max_value (int): Set to the maximum value allowed for this
                 param. If the param is found and its value is greater than
-                max, an ``HTTPError`` is raised.
+                max_value, an ``HTTPError`` is raised.
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is found
                 (default ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
 
         Returns:
             int: The value of the param if it is found and can be converted to
@@ -1195,7 +1192,7 @@ class Request(object):
                 it was required to be there, or it was found but could not
                 be converted to an ``int``. Also raised if the param's value
                 falls outside the given interval, i.e., the value must be in
-                the interval: min <= value <= max to avoid triggering an error.
+                the interval: min_value <= value <= max_value to avoid triggering an error.
 
         """
 
@@ -1214,12 +1211,12 @@ class Request(object):
                 msg = 'The value must be an integer.'
                 raise errors.HTTPInvalidParam(msg, name)
 
-            if min is not None and val < min:
-                msg = 'The value must be at least ' + str(min)
+            if min_value is not None and val < min_value:
+                msg = 'The value must be at least ' + str(min_value)
                 raise errors.HTTPInvalidParam(msg, name)
 
-            if max is not None and max < val:
-                msg = 'The value may not exceed ' + str(max)
+            if max_value is not None and max_value < val:
+                msg = 'The value may not exceed ' + str(max_value)
                 raise errors.HTTPInvalidParam(msg, name)
 
             if store is not None:
@@ -1228,11 +1225,82 @@ class Request(object):
             return val
 
         if not required:
-            return None
+            return default
 
         raise errors.HTTPMissingParam(name)
 
-    def get_param_as_uuid(self, name, required=False, store=None):
+    def get_param_as_float(self, name, required=False, min_value=None,
+                           max_value=None, store=None, default=None):
+        """Return the value of a query string parameter as an float.
+
+        Args:
+            name (str): Parameter name, case-sensitive (e.g., 'limit').
+
+        Keyword Args:
+            required (bool): Set to ``True`` to raise
+                ``HTTPBadRequest`` instead of returning ``None`` when the
+                parameter is not found or is not an float (default
+                ``False``).
+            min_value (float): Set to the minimum value allowed for this
+                param. If the param is found and it is less than min_value, an
+                ``HTTPError`` is raised.
+            max_value (float): Set to the maximum value allowed for this
+                param. If the param is found and its value is greater than
+                max_value, an ``HTTPError`` is raised.
+            store (dict): A ``dict``-like object in which to place
+                the value of the param, but only if the param is found
+                (default ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
+
+        Returns:
+            float: The value of the param if it is found and can be converted to
+            an ``float``. If the param is not found, returns ``None``, unless
+            `required` is ``True``.
+
+        Raises
+            HTTPBadRequest: The param was not found in the request, even though
+                it was required to be there, or it was found but could not
+                be converted to an ``float``. Also raised if the param's value
+                falls outside the given interval, i.e., the value must be in
+                the interval: min_value <= value <= max_value to avoid triggering an error.
+
+        """
+
+        params = self._params
+
+        # PERF: Use if..in since it is a good all-around performer; we don't
+        #       know how likely params are to be specified by clients.
+        if name in params:
+            val = params[name]
+            if isinstance(val, list):
+                val = val[-1]
+
+            try:
+                val = float(val)
+            except ValueError:
+                msg = 'The value must be a float.'
+                raise errors.HTTPInvalidParam(msg, name)
+
+            if min_value is not None and val < min_value:
+                msg = 'The value must be at least ' + str(min_value)
+                raise errors.HTTPInvalidParam(msg, name)
+
+            if max_value is not None and max_value < val:
+                msg = 'The value may not exceed ' + str(max_value)
+                raise errors.HTTPInvalidParam(msg, name)
+
+            if store is not None:
+                store[name] = val
+
+            return val
+
+        if not required:
+            return default
+
+        raise errors.HTTPMissingParam(name)
+
+    def get_param_as_uuid(self, name, required=False, store=None, default=None):
         """Return the value of a query string parameter as an UUID.
 
         The value to convert must conform to the standard UUID string
@@ -1259,11 +1327,13 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is found
                 (default ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
 
         Returns:
             UUID: The value of the param if it is found and can be converted to
-            a ``UUID``. If the param is not found, returns ``None``, unless
-            `required` is ``True``.
+            a ``UUID``. If the param is not found, returns
+            ``default`` (default ``None``), unless `required` is ``True``.
 
         Raises
             HTTPBadRequest: The param was not found in the request, even though
@@ -1292,13 +1362,19 @@ class Request(object):
             return val
 
         if not required:
-            return None
+            return default
 
         raise errors.HTTPMissingParam(name)
 
     def get_param_as_bool(self, name, required=False, store=None,
-                          blank_as_true=False):
-        """Return the value of a query string parameter as a boolean
+                          blank_as_true=True, default=None):
+        """Return the value of a query string parameter as a boolean.
+
+        This method treats valueless parameters as flags. By default, if no
+        value is provided for the parameter in the query string, ``True`` is
+        assumed and returned. If the parameter is missing altogether, ``None``
+        is returned as with other ``get_param_*()`` methods, which can be
+        easily treated as falsy by the caller as needed.
 
         The following boolean strings are supported::
 
@@ -1316,17 +1392,19 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is found (default
                 ``None``).
-            blank_as_true (bool): If ``True``, an empty string value will be
-                treated as ``True`` (default ``False``). Normally empty strings
-                are ignored; if you would like to recognize such parameters, you
-                must set the `keep_blank_qs_values` request option to ``True``.
-                Request options are set globally for each instance of
-                ``falcon.API`` through the `req_options` attribute.
+            blank_as_true (bool): Valueless query string parameters
+                are treated as flags, resulting in ``True`` being
+                returned when such a parameter is present, and ``False``
+                otherwise. To require the client to explicitly opt-in to a
+                truthy value, pass ``blank_as_true=False`` to return ``False``
+                when a value is not specified in the query string.
+            default (any): If the param is not found, return this
+                value instead of ``None``.
 
         Returns:
             bool: The value of the param if it is found and can be converted
             to a ``bool``. If the param is not found, returns ``None``
-            unless required is ``True``.
+            unless `required` is ``True``.
 
         Raises:
             HTTPBadRequest: A required param is missing from the request, or
@@ -1347,8 +1425,8 @@ class Request(object):
                 val = True
             elif val in FALSE_STRINGS:
                 val = False
-            elif blank_as_true and not val:
-                val = True
+            elif not val:
+                val = blank_as_true
             else:
                 msg = 'The value of the parameter must be "true" or "false".'
                 raise errors.HTTPInvalidParam(msg, name)
@@ -1359,12 +1437,12 @@ class Request(object):
             return val
 
         if not required:
-            return None
+            return default
 
         raise errors.HTTPMissingParam(name)
 
-    def get_param_as_list(self, name,
-                          transform=None, required=False, store=None):
+    def get_param_as_list(self, name, transform=None,
+                          required=False, store=None, default=None):
         """Return the value of a query string parameter as a list.
 
         List items must be comma-separated or must be provided
@@ -1386,6 +1464,8 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is found (default
                 ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
 
         Returns:
             list: The value of the param if it is found. Otherwise, returns
@@ -1432,12 +1512,12 @@ class Request(object):
             return items
 
         if not required:
-            return None
+            return default
 
         raise errors.HTTPMissingParam(name)
 
     def get_param_as_datetime(self, name, format_string='%Y-%m-%dT%H:%M:%SZ',
-                              required=False, store=None):
+                              required=False, store=None, default=None):
         """Return the value of a query string parameter as a datetime.
 
         Args:
@@ -1453,6 +1533,8 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is found (default
                 ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
         Returns:
             datetime.datetime: The value of the param if it is found and can be
             converted to a ``datetime`` according to the supplied format
@@ -1467,7 +1549,7 @@ class Request(object):
         param_value = self.get_param(name, required=required)
 
         if param_value is None:
-            return None
+            return default
 
         try:
             date_time = strptime(param_value, format_string)
@@ -1481,7 +1563,7 @@ class Request(object):
         return date_time
 
     def get_param_as_date(self, name, format_string='%Y-%m-%d',
-                          required=False, store=None):
+                          required=False, store=None, default=None):
         """Return the value of a query string parameter as a date.
 
         Args:
@@ -1497,6 +1579,8 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place
                 the value of the param, but only if the param is found (default
                 ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
         Returns:
             datetime.date: The value of the param if it is found and can be
             converted to a ``date`` according to the supplied format
@@ -1512,14 +1596,14 @@ class Request(object):
         if date_time:
             date = date_time.date()
         else:
-            return None
+            return default
 
         if store is not None:
             store[name] = date
 
         return date
 
-    def get_param_as_json(self, name, required=False, store=None):
+    def get_param_as_json(self, name, required=False, store=None, default=None):
         """Return the decoded JSON value of a query string parameter.
 
         Given a JSON value, decode it to an appropriate Python type,
@@ -1535,6 +1619,8 @@ class Request(object):
             store (dict): A ``dict``-like object in which to place the
                 value of the param, but only if the param is found
                 (default ``None``).
+            default (any): If the param is not found returns the
+                given value instead of ``None``
 
         Returns:
             dict: The value of the param if it is found. Otherwise, returns
@@ -1548,7 +1634,7 @@ class Request(object):
         param_value = self.get_param(name, required=required)
 
         if param_value is None:
-            return None
+            return default
 
         try:
             val = json.loads(param_value)
@@ -1561,13 +1647,22 @@ class Request(object):
 
         return val
 
-    get_param_as_dict = get_param_as_json
-    """Deprecated alias of :meth:`~get_param_as_json`.
+    def has_param(self, name):
+        """Determine whether or not the query string parameter already exists.
 
-    Warning:
+        Args:
+            name (str): Parameter name, case-sensitive (e.g., 'sort').
 
-        This method has been deprecated and will be removed in a future release.
-    """
+        Returns:
+            bool: ``True`` if param is found, or ``False`` if param is
+            not found.
+
+        """
+
+        if name in self._params:
+            return True
+        else:
+            return False
 
     def log_error(self, message):
         """Write an error message to the server's log.
@@ -1639,8 +1734,8 @@ class Request(object):
         if body:
             extra_params = parse_query_string(
                 body,
-                keep_blank_qs_values=self.options.keep_blank_qs_values,
-                parse_qs_csv=self.options.auto_parse_qs_csv,
+                keep_blank=self.options.keep_blank_qs_values,
+                csv=self.options.auto_parse_qs_csv,
             )
 
             self._params.update(extra_params)
@@ -1654,8 +1749,8 @@ class RequestOptions(object):
     configuring certain :py:class:`~.Request` behaviors.
 
     Attributes:
-        keep_blank_qs_values (bool): Set to ``True`` to keep query string
-            fields even if they do not have a value (default ``False``).
+        keep_blank_qs_values (bool): Set to ``False`` to ignore query string
+            params that have missing or blank values (default ``True``).
             For comma-separated values, this option also determines
             whether or not empty elements in the parsed list are
             retained.
@@ -1684,18 +1779,19 @@ class RequestOptions(object):
                 encoded according to the standard W3C algorithm (see
                 also http://goo.gl/6rlcux).
 
-        auto_parse_qs_csv: Set to ``False`` to treat commas in a query
-            string value as literal characters, rather than as a comma-
-            separated list (default ``True``). When this option is
-            enabled, the value will be split on any non-percent-encoded
-            commas. Disable this option when encoding lists as multiple
-            occurrences of the same parameter, and when values may be
-            encoded in alternative formats in which the comma character
-            is significant.
+        auto_parse_qs_csv: Set to ``True`` to split query string values on
+            any non-percent-encoded commas (default ``False``). When ``False``,
+            values containing commas are left as-is. In this mode, list items
+            are taken only from multiples of the same parameter name within the
+            query string (i.e. ``/?t=1,2,3&t=4`` becomes ``['1,2,3', '4']``).
+            When `auto_parse_qs_csv` is set to ``True``, the query string value
+            is also split on non-percent-encoded commas and these items
+            are added to the final list (i.e. ``/?t=1,2,3&t=4``
+            becomes ``['1', '2', '3', '4']``).
 
-        strip_url_path_trailing_slash: Set to ``False`` in order to
-            retain a trailing slash, if present, at the end of the URL
-            path (default ``True``). When this option is enabled,
+        strip_url_path_trailing_slash: Set to ``True`` in order to
+            strip the trailing slash, if present, at the end of the URL
+            path (default ``False``). When this option is enabled,
             the URL path is normalized by stripping the trailing slash
             character. This lets the application define a single route
             to a resource for a path that may or may not end in a
@@ -1724,9 +1820,9 @@ class RequestOptions(object):
     )
 
     def __init__(self):
-        self.keep_blank_qs_values = False
+        self.keep_blank_qs_values = True
         self.auto_parse_form_urlencoded = False
-        self.auto_parse_qs_csv = True
-        self.strip_url_path_trailing_slash = True
+        self.auto_parse_qs_csv = False
+        self.strip_url_path_trailing_slash = False
         self.default_media_type = DEFAULT_MEDIA_TYPE
         self.media_handlers = Handlers()
